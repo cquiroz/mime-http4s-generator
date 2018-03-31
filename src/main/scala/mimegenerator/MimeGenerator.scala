@@ -174,5 +174,8 @@ object MimeLoader extends App {
       _ <- Stream.emit(treeToFile(f, o))
     } yield ()).compile.drain
 
+  def unsafeSyncToFile(f: File, topLevelPackge: String, objectName: String, mediaTypeClassName: String): Unit =
+    toFile(f, topLevelPackge, objectName, mediaTypeClassName).unsafeRunSync
+
   toFile(new File("MimeDB.scala"), "org.http4s", s"MimeDB", "MediaType").attempt.unsafeRunSync
 }
