@@ -8,7 +8,8 @@ import fs2.Stream
 import org.http4s.circe._
 import io.circe.generic.semiauto._
 import treehugger.forest._, definitions._, treehuggerDSL._
-import java.nio.file.Path
+
+import java.io.File
 import java.io.PrintWriter
 
 final case class MimeDescr(extensions: Option[List[String]], compressible: Option[Boolean])
@@ -97,20 +98,22 @@ final case class Mime(mainType: String, secondaryType: String, descr: MimeDescr)
     }
     case _ => false
   }
-  val extensions: Tree = LIST(descr.extensions.getOrElse(Nil).map(LIT))
+  val extensions: Tree = descr.extensions.filter(_.length > 0).map(x => LIST(x.map(LIT))).getOrElse(NIL)
   val valName: String = s"`$mainType/$secondaryType`"
   def toTree(mediaTypeClass: ClassSymbol): Tree =
-    VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, LIT(mainType), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary), extensions)
+    VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary), extensions)
 
 }
 
 object MimeLoader extends App {
   implicit val MimeDescrDecoder: Decoder[MimeDescr] = deriveDecoder[MimeDescr]
+  val url = "https://cdn.rawgit.com/jshttp/mime-db/master/db.json"
 
   val readMimeDB: Stream[IO, List[Mime]] =
     for {
       client <- Http1Client.stream[IO]()
-      value <- Stream.eval(client.expect[Json]("https://cdn.rawgit.com/jshttp/mime-db/master/db.json"))
+      _ <- Stream.emit(println(s"Downloading mimedb from $url"))
+      value <- Stream.eval(client.expect[Json](url))
       obj <- Stream.emit(value.arrayOrObject(JsonObject.empty, _ => JsonObject.empty, identity))
     } yield {
       obj.toMap.map(x => (x._1.split("/").toList, x._2)).collect {
@@ -127,17 +130,35 @@ object MimeLoader extends App {
     mimes <- readMimeDB
   } yield mimes
 
-  def toTree(topLevelPackge: String, objectName: String, mediaTypeClassName: String)(mimes: List[Mime]): Tree = {
-    val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
-    val mediaTypeClass = RootClass.newClass(mediaTypeClassName)
-    val vals: List[Tree] = mimes.map(_.toTree(mediaTypeClass))
-    val allVals = vals :+ all
-    val privateWithin = topLevelPackge.split("\\.").toList.lastOption.getOrElse("this")
-    (((OBJECTDEF(objectName) withFlags(PRIVATEWITHIN(privateWithin))) := BLOCK(IMPORT(s"$topLevelPackge.$mediaTypeClassName") :: allVals))) inPackage(topLevelPackge)
+  def toTree(mainType: String, objectName: String, mediaTypeClassName: String)(mimes: List[Mime]): (Tree, String) = {
+    val subObjects: List[(String, Tree)] = mimes.sliding(500, 500).zipWithIndex.map {
+      case (mimes, i) =>
+        val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
+        val mainTypeVal = VAL("mainType", StringClass) := LIT(mainType)
+        val mediaTypeClass = RootClass.newClass(mediaTypeClassName)
+        val vals: List[Tree] = mimes.map(_.toTree(mediaTypeClass))
+        val allVals = (mainTypeVal :: vals) :+ all
+        val mimeObjectName = if (i > 0) s"${objectName}_$i" else objectName
+        (mimeObjectName, (OBJECTDEF(mimeObjectName) := BLOCK(allVals)))
+    }.toList
+    val reducedAll = subObjects.map(m => REF(s"${m._1}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
+    val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
+    val objectDefinition = OBJECTDEF(objectName) := BLOCK(all :: subObjects.map(_._2))
+    (objectDefinition, mainType)
   }
 
-  private def treeToFile(f: Path, t: Tree): Unit = {
-    val writer = new PrintWriter(f.toFile)
+  def coalesce(l: List[(Tree, String)], topLevelPackge: String, objectName: String, mediaTypeClassName: String): Tree = {
+    val privateWithin = topLevelPackge.split("\\.").toList.lastOption.getOrElse("this")
+    val reducedAll = l.map(m => REF(s"${objectName}_${m._2.replaceAll("-", "_")}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
+    val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
+    ((OBJECTDEF(objectName) withFlags(PRIVATEWITHIN(privateWithin)) := BLOCK(all :: l.map(_._1)))) inPackage(topLevelPackge)
+  }
+
+  // All actual file IO happens here
+  private def treeToFile(f: File, t: Tree): Unit = {
+    // Create the dir if needed
+    Option(f.getParentFile).foreach(_.mkdirs())
+    val writer = new PrintWriter(f)
     writer.write(treeToString(t))
     writer.close()
   }
@@ -145,12 +166,13 @@ object MimeLoader extends App {
   /**
    * This method will dowload the MimeDB and produce a file with generated code for http4s
    */
-  def toFile(f: Path): IO[Unit] =
+  def toFile(f: File, topLevelPackge: String, objectName: String, mediaTypeClassName: String): IO[Unit] =
     (for {
       m <- mimes
-      t <- Stream.emit(toTree("org.http4s", "MimeDB", "MediaType")(m))
-      _ <- Stream.emit(treeToFile(f, t))
+      t <- Stream.emit(m.groupBy(_.mainType).map { case (t, l) => toTree(t, s"${objectName}_${t.replaceAll("-", "_")}", mediaTypeClassName)(l) } )
+      o <- Stream.emit(coalesce(t.toList, topLevelPackge, objectName, mediaTypeClassName))
+      _ <- Stream.emit(treeToFile(f, o))
     } yield ()).compile.drain
 
-  mimes.map(toTree("org.http4s", "MimeDB", "MediaType")).map(x => println(treeToString(x))).compile.drain.unsafeRunSync
+  toFile(new File("MimeDB.scala"), "org.http4s", s"MimeDB", "MediaType").attempt.unsafeRunSync
 }
