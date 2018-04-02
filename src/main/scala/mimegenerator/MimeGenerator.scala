@@ -101,13 +101,20 @@ final case class Mime(mainType: String, secondaryType: String, descr: MimeDescr)
   val extensions: Tree = descr.extensions.filter(_.length > 0).map(x => LIST(x.map(LIT))).getOrElse(NIL)
   val valName: String = s"`$mainType/$secondaryType`"
   def toTree(mediaTypeClass: ClassSymbol): Tree =
-    VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary), extensions)
+    if (descr.extensions.isEmpty) {
+      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary))
+    } else {
+      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary), extensions)
+    }
 
 }
 
 object MimeLoader extends App {
   implicit val MimeDescrDecoder: Decoder[MimeDescr] = deriveDecoder[MimeDescr]
   val url = "https://cdn.rawgit.com/jshttp/mime-db/master/db.json"
+  // Due to the limits on the jvm class size (64k) we cannot put all instances in one go
+  // This particularly affects `application` which needs to be divided in 2
+  val maxSizePerSection = 500
 
   val readMimeDB: Stream[IO, List[Mime]] =
     for {
@@ -131,25 +138,32 @@ object MimeLoader extends App {
   } yield mimes
 
   def toTree(mainType: String, objectName: String, mediaTypeClassName: String)(mimes: List[Mime]): (Tree, String) = {
-    val subObjects: List[(String, Tree)] = mimes.sliding(500, 500).zipWithIndex.map {
-      case (mimes, i) =>
-        val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
-        val mainTypeVal = VAL("mainType", StringClass) := LIT(mainType)
-        val mediaTypeClass = RootClass.newClass(mediaTypeClassName)
-        val vals: List[Tree] = mimes.map(_.toTree(mediaTypeClass))
-        val allVals = (mainTypeVal :: vals) :+ all
-        val mimeObjectName = if (i > 0) s"${objectName}_$i" else objectName
-        (mimeObjectName, (OBJECTDEF(mimeObjectName) := BLOCK(allVals)))
-    }.toList
-    val reducedAll = subObjects.map(m => REF(s"${m._1}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
-    val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
-    val objectDefinition = OBJECTDEF(objectName) := BLOCK(all :: subObjects.map(_._2))
-    (objectDefinition, mainType)
+    def subObject(objectName: String, mimes: List[Mime]): Tree = {
+      val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
+      val mainTypeVal = VAL("mainType", StringClass) := LIT(mainType)
+      val mediaTypeClass = RootClass.newClass(mediaTypeClassName)
+      val vals: List[Tree] = mimes.map(_.toTree(mediaTypeClass))
+      val allVals = (mainTypeVal :: vals) :+ all
+      OBJECTDEF(objectName) := BLOCK(allVals)
+    }
+    if (mimes.length <= maxSizePerSection) {
+      (subObject(objectName, mimes), objectName)
+    } else {
+      val subObjects: List[(Tree, String)] = mimes.sliding(maxSizePerSection, maxSizePerSection).zipWithIndex.map {
+        case (mimes, i) =>
+          val mimeObjectName = if (i > 0) s"${objectName}_$i" else objectName
+          (subObject(mimeObjectName, mimes), mimeObjectName)
+      }.toList
+      val reducedAll = subObjects.map(m => REF(s"${m._2}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
+      val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
+      val objectDefinition = OBJECTDEF(objectName) := BLOCK(all :: subObjects.map(_._1))
+      (objectDefinition, mainType)
+    }
   }
 
   def coalesce(l: List[(Tree, String)], topLevelPackge: String, objectName: String, mediaTypeClassName: String): Tree = {
     val privateWithin = topLevelPackge.split("\\.").toList.lastOption.getOrElse("this")
-    val reducedAll = l.map(m => REF(s"${objectName}_${m._2.replaceAll("-", "_")}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
+    val reducedAll = l.map(m => REF(s"${m._2.replaceAll("-", "_")}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
     val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
     ((OBJECTDEF(objectName) withFlags(PRIVATEWITHIN(privateWithin)) := BLOCK(all :: l.map(_._1)))) inPackage(topLevelPackge)
   }
@@ -169,7 +183,7 @@ object MimeLoader extends App {
   def toFile(f: File, topLevelPackge: String, objectName: String, mediaTypeClassName: String): IO[Unit] =
     (for {
       m <- mimes
-      t <- Stream.emit(m.groupBy(_.mainType).map { case (t, l) => toTree(t, s"${objectName}_${t.replaceAll("-", "_")}", mediaTypeClassName)(l) } )
+      t <- Stream.emit(m.groupBy(_.mainType).map { case (t, l) => toTree(t, s"${t.replaceAll("-", "_")}", mediaTypeClassName)(l) } )
       o <- Stream.emit(coalesce(t.toList, topLevelPackge, objectName, mediaTypeClassName))
       _ <- Stream.emit(treeToFile(f, o))
     } yield ()).compile.drain
