@@ -98,24 +98,32 @@ final case class Mime(mainType: String, secondaryType: String, descr: MimeDescr)
     }
     case _ => false
   }
+  val compressibleRef = if (descr.compressible.forall(_ == true)) Mime.CompressibleRef else Mime.UncompressibleRef
+  val binaryRef = if (isBinary) Mime.BinaryRef else Mime.NotBinaryRef
   val extensions: Tree = descr.extensions.filter(_.length > 0).map(x => LIST(x.map(LIT))).getOrElse(NIL)
   val valName: String = s"`$mainType/$secondaryType`"
   def toTree(mediaTypeClass: ClassSymbol): Tree =
     if (descr.extensions.isEmpty) {
-      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary))
+      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef)
     } else {
-      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), LIT(descr.compressible.getOrElse(false)), LIT(isBinary), extensions)
+      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef, extensions)
     }
-
 }
 
-object MimeLoader extends App {
+object Mime {
+  // References to constans
+  val CompressibleRef = REF("Compressible")
+  val UncompressibleRef = REF("Uncompressible")
+  val BinaryRef = REF("Binary")
+  val NotBinaryRef = REF("NotBinary")
+}
+
+object MimeLoader {
   implicit val MimeDescrDecoder: Decoder[MimeDescr] = deriveDecoder[MimeDescr]
   val url = "https://cdn.rawgit.com/jshttp/mime-db/master/db.json"
   // Due to the limits on the jvm class size (64k) we cannot put all instances in one go
   // This particularly affects `application` which needs to be divided in 2
   val maxSizePerSection = 500
-
   val readMimeDB: Stream[IO, List[Mime]] =
     for {
       client <- Http1Client.stream[IO]()
@@ -164,8 +172,13 @@ object MimeLoader extends App {
   def coalesce(l: List[(Tree, String)], topLevelPackge: String, objectName: String, mediaTypeClassName: String): Tree = {
     val privateWithin = topLevelPackge.split("\\.").toList.lastOption.getOrElse("this")
     val reducedAll = l.map(m => REF(s"${m._2.replaceAll("-", "_")}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
-    val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
-    ((OBJECTDEF(objectName) withFlags(PRIVATEWITHIN(privateWithin)) := BLOCK(all :: l.map(_._1)))) inPackage(topLevelPackge)
+    val all: Tree = (LAZYVAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
+    val compressible: Tree = (VAL("Compressible", BooleanClass) := TRUE)
+    val uncompressible: Tree = (VAL("Uncompressible", BooleanClass) := TRUE)
+    val binary: Tree = (VAL("Binary", BooleanClass) := TRUE)
+    val notBinary: Tree = (VAL("NotBinary", BooleanClass) := TRUE)
+
+    ((OBJECTDEF(objectName) withFlags(PRIVATEWITHIN(privateWithin)) := BLOCK(List(all, compressible, uncompressible, binary, notBinary) ::: l.map(_._1)))) inPackage(topLevelPackge)
   }
 
   // All actual file IO happens here
@@ -191,5 +204,8 @@ object MimeLoader extends App {
   def unsafeSyncToFile(f: File, topLevelPackge: String, objectName: String, mediaTypeClassName: String): Unit =
     toFile(f, topLevelPackge, objectName, mediaTypeClassName).unsafeRunSync
 
-  toFile(new File("MimeDB.scala"), "org.http4s", s"MimeDB", "MediaType").attempt.unsafeRunSync
+}
+
+object MimeLoaderApp extends App {
+  MimeLoader.unsafeSyncToFile(new File("MimeDB.scala"), "org.http4s", s"MimeDB", "MediaType")
 }
