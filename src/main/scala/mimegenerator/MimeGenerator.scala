@@ -104,9 +104,9 @@ final case class Mime(mainType: String, secondaryType: String, descr: MimeDescr)
   val valName: String = s"`$mainType/$secondaryType`"
   def toTree(mediaTypeClass: ClassSymbol): Tree =
     if (descr.extensions.isEmpty) {
-      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef)
+      LAZYVAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef)
     } else {
-      VAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef, extensions)
+      LAZYVAL(valName, mediaTypeClass) := NEW(mediaTypeClass, REF("mainType"), LIT(secondaryType), compressibleRef, binaryRef, extensions)
     }
 }
 
@@ -147,7 +147,7 @@ object MimeLoader {
 
   def toTree(mainType: String, objectName: String, mediaTypeClassName: String)(mimes: List[Mime]): (Tree, String) = {
     def subObject(objectName: String, mimes: List[Mime]): Tree = {
-      val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
+      val all: Tree = (LAZYVAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName)))) := LIST(mimes.map(m => REF((m.valName))))
       val mainTypeVal = VAL("mainType", StringClass) := LIT(mainType)
       val mediaTypeClass = RootClass.newClass(mediaTypeClassName)
       val vals: List[Tree] = mimes.map(_.toTree(mediaTypeClass))
@@ -163,7 +163,7 @@ object MimeLoader {
           (subObject(mimeObjectName, mimes), mimeObjectName)
       }.toList
       val reducedAll = subObjects.map(m => REF(s"${m._2}.all")).foldLeft(NIL){ (a, b) => (a LIST_::: b) }
-      val all: Tree = (VAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
+      val all: Tree = (LAZYVAL("all", ListClass TYPE_OF TYPE_REF(REF(mediaTypeClassName))) := reducedAll)
       val objectDefinition = OBJECTDEF(objectName) := BLOCK(all :: subObjects.map(_._1))
       (objectDefinition, mainType)
     }
